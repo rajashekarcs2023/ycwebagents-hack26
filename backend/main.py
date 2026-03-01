@@ -25,6 +25,7 @@ from models import (
 from services import supermemory_client, agentmail_client, browser_use_client, vapi_client, minimax_tts, llm
 from services import composio_client
 from services import discord_webhook
+from services import llms_txt_crawler
 from services.discord_bot import start_bot, stop_bot
 
 
@@ -104,6 +105,20 @@ async def health():
 @app.post("/api/onboard", response_model=OnboardResponse)
 async def onboard(req: OnboardRequest, background_tasks: BackgroundTasks):
     slug = slugify(req.company_name)
+
+    # ── Check if company already exists (reuse for demo) ──
+    existing = db.get_by_field("companies", Company, "slug", slug)
+    if existing:
+        agent = db.get_by_field("agent_identities", AgentIdentity, "company_id", existing.company_id)
+        print(f"[Onboard] Reusing existing company: {existing.company_id} ({slug})")
+        return OnboardResponse(
+            company_id=existing.company_id,
+            slug=slug,
+            agentmail_address=agent.agentmail_address if agent else "",
+            vapi_phone_number=agent.vapi_phone_number if agent else "",
+            demo_mode=existing.demo_mode,
+        )
+
     company = Company(
         slug=slug,
         name=req.company_name,
@@ -181,12 +196,41 @@ Website: {req.website_url}"""
 
 
 async def _crawl_and_ingest(company_id: str, website_url: str, docs_urls: list[str]):
-    """Background task: crawl website, ingest into Supermemory."""
-    emit_activity(company_id, "crawling", "Crawling website", website_url, status="pending")
+    """Background task: crawl website + llms.txt, ingest into Supermemory."""
+    emit_activity(company_id, "crawling", "Crawling website & docs", website_url, status="pending")
 
     all_urls = [website_url] + docs_urls
     all_chunks = []
 
+    # Phase 1: Try llms.txt first (fast, reliable, AI-optimized content)
+    try:
+        llms_result = await llms_txt_crawler.crawl_and_index(website_url, company_id, max_pages=30)
+        if llms_result["found"]:
+            emit_activity(company_id, "crawling", "Indexed llms.txt",
+                          f"Found {llms_result['urls_found']} URLs, indexed {llms_result['pages_indexed']} pages ({llms_result['chunks_indexed']} chunks)")
+            print(f"[Crawl] llms.txt indexed: {llms_result}")
+        else:
+            print(f"[Crawl] No llms.txt found for {website_url}")
+    except Exception as e:
+        print(f"[Crawl] llms.txt crawl failed: {e}")
+
+    # Phase 2: Also try llms.txt for each doc URL domain (in case they have separate docs sites)
+    doc_domains_tried = set()
+    for doc_url in docs_urls:
+        from urllib.parse import urlparse
+        parsed = urlparse(doc_url)
+        domain_root = f"{parsed.scheme}://{parsed.netloc}"
+        if domain_root not in doc_domains_tried and domain_root != website_url.rstrip("/"):
+            doc_domains_tried.add(domain_root)
+            try:
+                doc_llms = await llms_txt_crawler.crawl_and_index(domain_root, company_id, max_pages=20)
+                if doc_llms["found"]:
+                    emit_activity(company_id, "crawling", f"Indexed docs llms.txt",
+                                  f"{domain_root}: {doc_llms['pages_indexed']} pages ({doc_llms['chunks_indexed']} chunks)")
+            except Exception as e:
+                print(f"[Crawl] Docs llms.txt failed for {domain_root}: {e}")
+
+    # Phase 3: Browser-based scraping for each URL
     for url in all_urls:
         ks = KnowledgeSource(company_id=company_id, url=url, status="crawling")
         db.insert("knowledge_sources", ks)
@@ -207,7 +251,7 @@ async def _crawl_and_ingest(company_id: str, website_url: str, docs_urls: list[s
         try:
             await supermemory_client.bulk_add_memory(all_chunks, company_id, source="website")
             emit_activity(company_id, "memory_built", "Knowledge memory built",
-                          f"Ingested {len(all_chunks)} knowledge chunks")
+                          f"Ingested {len(all_chunks)} knowledge chunks from browser scraping")
         except Exception as e:
             print(f"[Crawl] Supermemory ingest failed: {e}")
             emit_activity(company_id, "memory_built", "Memory build failed",
@@ -228,6 +272,14 @@ async def widget_ask(req: WidgetAskRequest, background_tasks: BackgroundTasks):
     # Retrieve context from Supermemory
     results = await supermemory_client.search_memory(req.question, req.company_id)
     context = supermemory_client.format_context(results)
+
+    # Include known doc page URLs so LLM can reference specific pages
+    if company.doc_page_urls:
+        context += f"\n\nAll known documentation page URLs for {company.name} (use the most relevant ones in suggested_links):\n"
+        context += "\n".join([f"- {u}" for u in company.doc_page_urls])
+    elif company.docs_urls:
+        context += f"\n\nDocs sites: {', '.join(company.docs_urls)}"
+    context += f"\nMain website: {company.website_url}"
 
     # Generate answer with LLM
     llm_result = await llm.generate_answer(
@@ -324,10 +376,12 @@ async def widget_ask(req: WidgetAskRequest, background_tasks: BackgroundTasks):
     return WidgetShowResponse(
         answer_text=llm_result["answer_text"],
         steps=llm_result["steps"],
-        final_url=company.website_url,
+        final_url=llm_result["suggested_links"][0] if llm_result["suggested_links"] else company.website_url,
         session_id=session_id,
         narration_script=llm_result["narration_script"],
         narration_audio_url=narration_audio_url,
+        suggested_links=llm_result["suggested_links"],
+        navigation_goal=llm_result["navigation_goal"],
     )
 
 
@@ -483,6 +537,28 @@ async def get_company(company_id: str | None = None, slug: str | None = None):
     }
 
 
+# ─── POST /api/crawl/llms-txt ─────────────────────────────────────────────────
+
+@app.post("/api/crawl/llms-txt")
+async def crawl_llms_txt(company_id: str, url: str, max_pages: int = 30):
+    """Manually trigger llms.txt crawling for a company."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    emit_activity(company_id, "crawling", "Starting llms.txt crawl", url, status="pending")
+
+    result = await llms_txt_crawler.crawl_and_index(url, company_id, max_pages=max_pages)
+
+    if result["found"]:
+        emit_activity(company_id, "memory_built", "llms.txt knowledge indexed",
+                      f"{result['pages_indexed']} pages, {result['chunks_indexed']} chunks")
+    else:
+        emit_activity(company_id, "crawling", "No llms.txt found", url, status="error")
+
+    return result
+
+
 # ─── Composio Endpoints ──────────────────────────────────────────────────────
 
 @app.post("/api/composio/authorize")
@@ -514,6 +590,434 @@ async def composio_authorize(toolkit: str, company_id: str, callback_url: str = 
 async def composio_toolkits(company_id: str):
     """Check which Composio toolkits are connected for a company."""
     return await composio_client.check_toolkits(user_id=company_id)
+
+
+# ─── LinkedIn Posting ─────────────────────────────────────────────────────────
+
+@app.post("/api/linkedin/generate")
+async def linkedin_generate(company_id: str, topic_hint: str = ""):
+    """Generate a LinkedIn post from recent community activity."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    # Gather recent activity as context
+    activity = db.get_all("activity_feed", ActivityFeedItem)
+    company_activity = [a for a in activity if a.company_id == company_id]
+    recent = company_activity[:20]
+
+    activity_text = "\n".join([
+        f"- [{a.type}] {a.title}: {a.detail}" for a in recent
+    ]) or "No recent activity — generate a general DevRel post about the company."
+
+    # Also pull recent conversation logs
+    convos = db.get_all("conversation_logs", ConversationLog)
+    company_convos = [c for c in convos if c.company_id == company_id][:10]
+    convo_text = "\n".join([
+        f"- Q: {c.question}\n  A: {c.answer}" for c in company_convos
+    ])
+
+    full_context = f"Activity:\n{activity_text}\n\nRecent Q&A:\n{convo_text}"
+
+    result = await llm.generate_linkedin_post(
+        company_name=company.name,
+        recent_activity=full_context,
+        tone=company.tone,
+        topic_hint=topic_hint,
+    )
+
+    return {
+        "post_text": result["post_text"],
+        "hashtags": result["hashtags"],
+    }
+
+
+@app.post("/api/linkedin/post")
+async def linkedin_post(company_id: str, post_text: str):
+    """Post to LinkedIn via Composio (requires LinkedIn authorization)."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    result = await composio_client.execute_linkedin_post(
+        user_id=company_id,
+        post_text=post_text,
+    )
+
+    if "error" in result:
+        raise HTTPException(500, result["error"])
+
+    emit_activity(company_id, "linkedin_posted",
+                  "Posted to LinkedIn",
+                  post_text[:100])
+
+    return result
+
+
+# ─── Leads Intelligence ──────────────────────────────────────────────────────
+
+@app.post("/api/leads/extract")
+async def extract_leads(company_id: str):
+    """Analyze recent conversations to extract potential developer leads."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    # Gather recent conversations
+    convos = db.get_many_by_field("conversation_logs", ConversationLog, "company_id", company_id)
+    convos.sort(key=lambda x: getattr(x, "ts", ""), reverse=True)
+    recent = convos[:20]
+
+    convo_text = "\n".join([
+        f"- [{c.platform}] User {getattr(c, 'user_id', 'anon')}: {c.question}\n  Agent: {c.answer}"
+        for c in recent
+    ])
+
+    if not convo_text.strip():
+        return {"leads": [], "summary": "No recent conversations to analyze."}
+
+    result = await llm.extract_leads(convo_text, company.name)
+
+    emit_activity(company_id, "leads_extracted",
+                  "Lead intelligence updated",
+                  f"Found {len(result['leads'])} potential leads")
+
+    return result
+
+
+@app.post("/api/calendar/schedule")
+async def schedule_meeting(
+    company_id: str,
+    title: str,
+    description: str = "",
+    start_datetime: str = "",
+    end_datetime: str = "",
+    attendee_email: str = "",
+):
+    """Schedule a Google Calendar meeting via Composio."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    # Default: schedule 30 min from now if no time given
+    if not start_datetime:
+        from datetime import datetime, timedelta
+        start = datetime.utcnow() + timedelta(hours=24)
+        start_datetime = start.isoformat() + "Z"
+        end_datetime = (start + timedelta(minutes=30)).isoformat() + "Z"
+    elif not end_datetime:
+        from datetime import datetime, timedelta
+        start = datetime.fromisoformat(start_datetime.replace("Z", ""))
+        end_datetime = (start + timedelta(minutes=30)).isoformat() + "Z"
+
+    result = await composio_client.create_calendar_event(
+        user_id=company_id,
+        title=title,
+        description=description,
+        start_datetime=start_datetime,
+        end_datetime=end_datetime,
+        attendee_email=attendee_email,
+    )
+
+    if "error" in result:
+        raise HTTPException(500, result["error"])
+
+    emit_activity(company_id, "calendar_scheduled",
+                  "Meeting scheduled",
+                  f"{title} — {attendee_email or 'no attendee'}")
+
+    return result
+
+
+@app.post("/api/sheets/log-lead")
+async def log_lead_to_sheet(
+    company_id: str,
+    spreadsheet_id: str,
+    lead_name: str,
+    interest: str,
+    score: int = 0,
+    suggested_action: str = "",
+):
+    """Log a lead to Google Sheets via Composio."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    values = [
+        now_iso(),
+        lead_name,
+        interest,
+        str(score),
+        suggested_action,
+        company.name,
+    ]
+
+    result = await composio_client.append_sheet_row(
+        user_id=company_id,
+        spreadsheet_id=spreadsheet_id,
+        values=values,
+    )
+
+    if "error" in result:
+        raise HTTPException(500, result["error"])
+
+    emit_activity(company_id, "sheet_updated",
+                  "Lead logged to Google Sheets",
+                  f"{lead_name} (score: {score})")
+
+    return result
+
+
+# ─── Slack → LinkedIn Pipeline ───────────────────────────────────────────────
+
+@app.post("/api/slack/fetch")
+async def fetch_slack_messages(company_id: str, channel: str = "all-calexai", limit: int = 20):
+    """Fetch recent messages from a Slack channel via Composio."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    result = await composio_client.fetch_slack_messages(
+        user_id=company_id,
+        channel_name=channel,
+        limit=limit,
+    )
+
+    if "error" in result:
+        raise HTTPException(500, result["error"])
+
+    emit_activity(company_id, "slack_fetched",
+                  f"Fetched Slack #{channel}",
+                  f"{len(result.get('messages', []))} messages")
+
+    return result
+
+
+@app.post("/api/slack/generate-linkedin")
+async def slack_to_linkedin(company_id: str, channel: str = "all-calexai"):
+    """Fetch Slack messages and auto-generate a LinkedIn post from them."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    # Step 1: Fetch Slack messages
+    slack_result = await composio_client.fetch_slack_messages(
+        user_id=company_id,
+        channel_name=channel,
+        limit=25,
+    )
+
+    messages = slack_result.get("messages", [])
+    if not messages:
+        return {"post_text": "", "hashtags": [], "slack_messages": 0,
+                "error": "No Slack messages found. Connect Slack via Composio first."}
+
+    # Step 2: Format messages as context
+    slack_text = "\n".join([
+        f"- {msg.get('user', 'someone')}: {msg.get('text', '')}"
+        for msg in messages if msg.get("text")
+    ])
+
+    # Step 3: Generate LinkedIn post using LLM
+    full_context = f"Slack conversations from #{channel}:\n{slack_text}"
+    result = await llm.generate_linkedin_post(
+        company_name=company.name,
+        recent_activity=full_context,
+        tone=company.tone,
+        topic_hint=f"Based on real Slack discussions in #{channel}",
+    )
+
+    emit_activity(company_id, "slack_linkedin_generated",
+                  "LinkedIn post generated from Slack",
+                  result.get("post_text", "")[:100])
+
+    return {
+        "post_text": result.get("post_text", ""),
+        "hashtags": result.get("hashtags", []),
+        "slack_messages": len(messages),
+    }
+
+
+# ─── AgentMail Endpoints ────────────────────────────────────────────────────
+
+@app.get("/api/agentmail/inbox")
+async def get_agentmail_inbox(company_id: str):
+    """Get the AgentMail inbox for this company's agent."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    agent = db.get_by_field("agent_identities", AgentIdentity, "company_id", company_id)
+    if not agent or not agent.agentmail_address:
+        return {"inbox": None, "messages": []}
+
+    try:
+        client = agentmail_client.get_client()
+        inbox_id = agent.agentmail_address
+        messages_resp = client.inboxes.messages.list(inbox_id=inbox_id)
+        messages = []
+        for msg in getattr(messages_resp, "messages", []) or []:
+            messages.append({
+                "id": getattr(msg, "id", "") or getattr(msg, "message_id", ""),
+                "from": getattr(msg, "from_", "") or getattr(msg, "sender", ""),
+                "to": getattr(msg, "to", ""),
+                "subject": getattr(msg, "subject", ""),
+                "text": getattr(msg, "text", "") or getattr(msg, "body", ""),
+                "date": getattr(msg, "date", "") or getattr(msg, "created_at", ""),
+                "direction": "inbound" if getattr(msg, "from_", "") != inbox_id else "outbound",
+            })
+        return {"inbox": inbox_id, "messages": messages}
+    except Exception as e:
+        print(f"[AgentMail] Inbox fetch error: {e}")
+        return {"inbox": agent.agentmail_address, "messages": [], "error": str(e)}
+
+
+@app.post("/api/agentmail/send")
+async def send_agentmail(
+    company_id: str,
+    to: str,
+    subject: str,
+    text: str,
+):
+    """Send an email from the agent's AgentMail inbox."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    agent = db.get_by_field("agent_identities", AgentIdentity, "company_id", company_id)
+    if not agent or not agent.agentmail_address:
+        raise HTTPException(400, "No agent inbox configured")
+
+    try:
+        await agentmail_client.send_email(
+            from_inbox=agent.agentmail_address,
+            to=to,
+            subject=subject,
+            text=text,
+        )
+        emit_activity(company_id, "email_sent",
+                      f"Email sent to {to}",
+                      subject[:100])
+        return {"status": "sent", "to": to, "subject": subject}
+    except Exception as e:
+        print(f"[AgentMail] Send error: {e}")
+        raise HTTPException(500, str(e))
+
+
+# ─── Dashboard Chat ──────────────────────────────────────────────────────────
+
+@app.post("/api/dashboard/chat")
+async def dashboard_chat(company_id: str, question: str):
+    """Internal DevRel chat — query activity, leads, and conversations."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    # Gather activity feed
+    activities = db.get_many_by_field("activity_feed", ActivityFeedItem, "company_id", company_id)
+    activities.sort(key=lambda x: getattr(x, "ts", ""), reverse=True)
+    recent_activities = activities[:30]
+    activity_text = "\n".join([
+        f"- [{a.ts[:16]}] {a.type}: {a.title} — {a.detail}"
+        for a in recent_activities
+    ]) or "No recent activity."
+
+    # Gather conversations
+    convos = db.get_many_by_field("conversation_logs", ConversationLog, "company_id", company_id)
+    convos.sort(key=lambda x: getattr(x, "created_at", ""), reverse=True)
+    recent_convos = convos[:20]
+    convos_text = "\n".join([
+        f"- [{c.platform}] {getattr(c, 'user_id', 'anon')}: \"{c.question}\" → \"{c.answer[:80]}\" (confidence: {c.confidence:.0%}, escalated: {c.escalated})"
+        for c in recent_convos
+    ]) or "No recent conversations."
+
+    # Gather leads (run extraction if needed)
+    leads_text = "No leads extracted yet. User can click 'Extract Leads' on the dashboard."
+
+    answer = await llm.dashboard_chat(
+        question=question,
+        company_name=company.name,
+        activity_summary=activity_text,
+        conversations_summary=convos_text,
+        leads_summary=leads_text,
+    )
+
+    return {"answer": answer}
+
+
+# ─── Browser Use: Daily Lead Research Cron ───────────────────────────────────
+
+@app.post("/api/cron/daily-research")
+async def daily_lead_research(company_id: str, background_tasks: BackgroundTasks):
+    """Trigger the daily Browser Use research job: find leads, community signals, competitor activity."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    emit_activity(company_id, "cron_started",
+                  "Daily research job started",
+                  "Browser Use agent scanning for leads and activity", status="pending")
+
+    background_tasks.add_task(_run_daily_research, company_id, company.name, company.website_url)
+    return {"status": "started", "message": "Daily research job queued"}
+
+
+async def _run_daily_research(company_id: str, company_name: str, website_url: str):
+    """Background: Use Browser Use to research leads and DevRel-relevant activity."""
+    research_prompt = f"""You are a DevRel research agent for {company_name} ({website_url}).
+Your daily job is to find valuable intelligence. Do the following:
+
+1. Go to GitHub and search for "{company_name}" — find recent issues, discussions, or mentions. Note any developers who seem interested.
+2. Go to Twitter/X and search for "{company_name}" — find recent tweets mentioning the product. Note usernames and what they said.
+3. Go to Reddit and search for "{company_name}" — find any threads or comments about it.
+4. Check Hacker News for any mentions.
+
+For each finding, report:
+- Platform (GitHub/Twitter/Reddit/HN)
+- Username
+- What they said or did
+- Lead score (1-10, how likely they are to be a real lead)
+- Suggested follow-up action
+
+Format as a structured report."""
+
+    try:
+        client = browser_use_client.get_client()
+        result = await client.run(research_prompt)
+        output = result.output if hasattr(result, "output") else str(result)
+
+        # Log the research as a browser run
+        run = BrowserRun(
+            company_id=company_id,
+            purpose="daily_lead_research",
+            status="completed",
+            run_log=[f"Daily research completed at {now_iso()}", output[:500]],
+            final_url="https://github.com",
+        )
+        db.insert("browser_runs", run)
+
+        # Store research into Supermemory for the dashboard chat to access
+        try:
+            await supermemory_client.add_memory(
+                content=f"Daily research report ({now_iso()}):\n{output}",
+                company_id=company_id,
+                metadata={"source": "daily_research", "date": now_iso()},
+            )
+        except Exception:
+            pass
+
+        # Extract leads from the research using LLM
+        leads_result = await llm.extract_leads(output, company_name)
+
+        emit_activity(company_id, "cron_completed",
+                      "Daily research completed",
+                      f"Found {len(leads_result.get('leads', []))} potential leads across GitHub, Twitter, Reddit, HN")
+
+    except Exception as e:
+        print(f"[Cron] Daily research failed: {e}")
+        emit_activity(company_id, "cron_completed",
+                      "Daily research failed",
+                      str(e), status="error")
 
 
 # ─── Run ─────────────────────────────────────────────────────────────────────

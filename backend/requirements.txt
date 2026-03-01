@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn==0.34.0
+python-dotenv==1.0.1
+openai==1.58.1
+supermemory==3.27.0
+agentmail==0.2.22
+browser-use-sdk
+httpx==0.28.1
+pydantic==2.10.4
+discord.py==2.4.0
+composio==0.7.5
+composio-openai-agents==0.7.5

@@ -32,26 +32,30 @@ export function ActivityFeed({ companyId, onWatch }: ActivityFeedProps) {
 
   if (error && items.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
-        <Inbox className="mb-3 h-10 w-10" />
-        <p className="text-sm">Unable to load activity feed</p>
-        <p className="text-xs mt-1">Make sure the backend is running</p>
+      <div className="flex flex-col items-center justify-center rounded-2xl border border-white/5 bg-white/[0.02] py-16">
+        <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-red-500/10">
+          <Inbox className="h-6 w-6 text-red-400" />
+        </div>
+        <p className="text-sm font-semibold text-foreground">Unable to load activity</p>
+        <p className="text-xs mt-1 text-muted-foreground">Make sure the backend is running on localhost:3001</p>
       </div>
     )
   }
 
   if (items.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
-        <Inbox className="mb-3 h-10 w-10" />
-        <p className="text-sm">No activity yet</p>
-        <p className="text-xs mt-1">Events will appear here in real-time</p>
+      <div className="flex flex-col items-center justify-center rounded-2xl border border-white/5 bg-white/[0.02] py-16">
+        <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-violet-500/10">
+          <Inbox className="h-6 w-6 text-violet-400" />
+        </div>
+        <p className="text-sm font-semibold text-foreground">No activity yet</p>
+        <p className="text-xs mt-1 text-muted-foreground">Events will appear here in real-time</p>
       </div>
     )
   }
 
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-2.5">
       {items.map((item, i) => (
         <ActivityItem key={`${item.ts}-${i}`} item={item} onWatch={onWatch} />
       ))}

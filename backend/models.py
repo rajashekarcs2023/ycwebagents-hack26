@@ -23,6 +23,7 @@ class Company(BaseModel):
     name: str = ""
     website_url: str = ""
     docs_urls: list[str] = []
+    doc_page_urls: list[str] = []
     tone: str = "friendly"
     founder_email: str = ""
     demo_mode: bool = True
@@ -126,6 +127,8 @@ class WidgetShowResponse(BaseModel):
     session_id: str = ""
     narration_script: str = ""
     narration_audio_url: Optional[str] = None
+    suggested_links: list[str] = []
+    navigation_goal: str = ""
 
 
 class CommunityEventRequest(BaseModel):

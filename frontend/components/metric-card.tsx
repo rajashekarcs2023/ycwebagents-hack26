@@ -33,7 +33,7 @@ export function MetricCard({ title, value, icon: Icon, trend, color = "violet" }
           </span>
         )}
       </div>
-      <p className="text-sm text-muted-foreground mb-1">{title}</p>
+      <p className="text-base text-muted-foreground mb-1">{title}</p>
       <p className="text-3xl font-bold tracking-tight text-foreground">{value}</p>
     </div>
   )

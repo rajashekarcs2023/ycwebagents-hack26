@@ -21,7 +21,7 @@ import {
 import { MetricCard } from "@/components/metric-card"
 import { ActivityFeed, useActivityMetrics } from "@/components/activity-feed"
 import { WalkthroughModal } from "@/components/walkthrough-modal"
-import { simulateCommunityEvent, generateLinkedInPost, postToLinkedIn, authorizeComposio, extractLeads, scheduleMeeting, logLeadToSheet, generateLinkedInFromSlack, getAgentMailInbox, sendAgentMail, dashboardChat, triggerDailyResearch, type Lead, type AgentMailMessage } from "@/lib/api"
+import { simulateCommunityEvent, generateLinkedInPost, postToLinkedIn, authorizeComposio, extractLeads, scheduleMeeting, logLeadToSheet, generateLinkedInFromSlack, getAgentMailInbox, sendAgentMail, triggerAutoReply, dashboardChat, triggerDailyResearch, getResearchStatus, type Lead, type AgentMailMessage } from "@/lib/api"
 import { Linkedin, RefreshCw, CheckCircle2, Link2, Users, Calendar, FileSpreadsheet, Star, ArrowRight, Mail, Inbox, SendHorizontal, MessageSquareText, MessageCircle, Search, X } from "lucide-react"
 
 export default function DashboardPage() {
@@ -55,6 +55,7 @@ export default function DashboardPage() {
   const [mailSubject, setMailSubject] = useState("")
   const [mailBody, setMailBody] = useState("")
   const [mailSending, setMailSending] = useState(false)
+  const [autoReplying, setAutoReplying] = useState(false)
 
   useEffect(() => {
     const id = localStorage.getItem("calex_company_id")
@@ -126,6 +127,8 @@ export default function DashboardPage() {
       setMailBody={setMailBody}
       mailSending={mailSending}
       setMailSending={setMailSending}
+      autoReplying={autoReplying}
+      setAutoReplying={setAutoReplying}
     />
   )
 }
@@ -186,6 +189,8 @@ function DashboardContent({
   setMailBody,
   mailSending,
   setMailSending,
+  autoReplying,
+  setAutoReplying,
 }: {
   companyId: string
   companyName: string
@@ -242,9 +247,39 @@ function DashboardContent({
   setMailBody: (s: string) => void
   mailSending: boolean
   setMailSending: (b: boolean) => void
+  autoReplying: boolean
+  setAutoReplying: (b: boolean) => void
 }) {
   const metrics = useActivityMetrics(companyId)
   const slug = typeof window !== "undefined" ? localStorage.getItem("calex_slug") : null
+  const [showLeads, setShowLeads] = useState(true)
+  const [researchStatus, setResearchStatus] = useState<string>("idle")
+  const [researchLog, setResearchLog] = useState<string[]>([])
+  const [researchResult, setResearchResult] = useState<string | null>(null)
+
+  const handleRunResearch = async () => {
+    setResearchStatus("running")
+    setResearchLog(["Starting live research..."])
+    setResearchResult(null)
+    try {
+      await triggerDailyResearch(companyId)
+      // Poll for status
+      const poll = setInterval(async () => {
+        try {
+          const s = await getResearchStatus(companyId)
+          setResearchLog(s.log || [])
+          if (s.status !== "running") {
+            clearInterval(poll)
+            setResearchStatus(s.status)
+            setResearchResult(s.result)
+          }
+        } catch { /* ignore */ }
+      }, 3000)
+    } catch {
+      setResearchStatus("error")
+      setResearchLog(["Failed to start research"])
+    }
+  }
 
   const handleSimulate = async () => {
     if (!simMessage.trim()) return
@@ -312,35 +347,29 @@ function DashboardContent({
     }
   }
 
-  const handleScheduleMeeting = async (lead: Lead) => {
+  const handleScheduleMeeting = (lead: Lead) => {
     setSchedulingLead(lead.name)
-    try {
-      await scheduleMeeting(
-        companyId,
-        `Calex: ${lead.meeting_topic}`,
-        `Lead: ${lead.name}\nInterest: ${lead.interest}\nScore: ${lead.score}/10`,
-        undefined,
-        undefined,
-        lead.email || undefined,
-      )
-      alert(`Meeting scheduled for lead: ${lead.name}`)
-    } catch {
-      alert("Calendar scheduling failed. Connect Google Calendar via Composio first.")
-    } finally {
-      setSchedulingLead(null)
-    }
+    // Generate a Google Calendar event URL
+    const now = new Date()
+    const start = new Date(now.getTime() + 24 * 60 * 60 * 1000) // tomorrow
+    start.setHours(10, 0, 0, 0)
+    const end = new Date(start.getTime() + 30 * 60 * 1000) // 30 min
+    const fmt = (d: Date) => d.toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "")
+    const calUrl = `https://calendar.google.com/calendar/render?action=TEMPLATE` +
+      `&text=${encodeURIComponent(`Calex Follow-up: ${lead.name}`)}` +
+      `&dates=${fmt(start)}/${fmt(end)}` +
+      `&details=${encodeURIComponent(`Lead: ${lead.name}\nInterest: ${lead.interest}\nScore: ${lead.score}/10\nAction: ${lead.suggested_action}\n\nAuto-scheduled by Calex AI DevRel Agent`)}` +
+      (lead.email ? `&add=${encodeURIComponent(lead.email)}` : "")
+    window.open(calUrl, "_blank")
+    setTimeout(() => setSchedulingLead(null), 1000)
   }
 
-  const handleLogToSheet = async (lead: Lead) => {
-    if (!sheetId.trim()) {
-      alert("Enter a Google Sheet ID first.")
-      return
-    }
-    try {
-      await logLeadToSheet(companyId, sheetId, lead.name, lead.interest, lead.score, lead.suggested_action)
-      alert(`Lead ${lead.name} logged to sheet!`)
-    } catch {
-      alert("Sheet logging failed. Connect Google Sheets via Composio first.")
+  const handleLogToSheet = (lead: Lead) => {
+    // Open Google Sheets directly — for demo, open a new sheet
+    if (sheetId.trim()) {
+      window.open(`https://docs.google.com/spreadsheets/d/${sheetId}/edit`, "_blank")
+    } else {
+      window.open("https://sheets.google.com/create", "_blank")
     }
   }
 
@@ -355,35 +384,45 @@ function DashboardContent({
     }
   }
 
-  const handleSlackToLinkedIn = async () => {
-    setSlackLinkedinLoading(true)
-    setSlackLinkedinDraft(null)
-    setSlackLinkedinPosted(false)
-    try {
-      const res = await generateLinkedInFromSlack(companyId, slackChannel)
-      if (res.error) {
-        setSlackLinkedinDraft(res.error)
-      } else {
-        setSlackLinkedinDraft(res.post_text + "\n\n" + res.hashtags.join(" "))
-      }
-    } catch {
-      setSlackLinkedinDraft("Failed — connect Slack via Composio first.")
-    } finally {
-      setSlackLinkedinLoading(false)
-    }
-  }
+  // Auto-load daily LinkedIn recommendation on mount
+  useEffect(() => {
+    const loadDaily = async () => {
+      // Auto-fetch leads
+      setLeadsLoading(true)
+      try {
+        const lr = await extractLeads(companyId)
+        setLeads(lr.leads)
+        setLeadsSummary(lr.summary)
+      } catch { /* silent */ }
+      setLeadsLoading(false)
 
-  const handlePostSlackLinkedIn = async () => {
-    if (!slackLinkedinDraft) return
-    setSlackLinkedinLoading(true)
-    try {
-      await postToLinkedIn(companyId, slackLinkedinDraft)
-      setSlackLinkedinPosted(true)
-    } catch {
-      alert("LinkedIn posting failed. Connect LinkedIn via Composio.")
-    } finally {
+      // Auto-generate LinkedIn post from Slack
+      setSlackLinkedinLoading(true)
+      try {
+        const res = await generateLinkedInFromSlack(companyId, slackChannel)
+        if (!res.error) {
+          setSlackLinkedinDraft(res.post_text + "\n\n" + res.hashtags.join(" "))
+        }
+      } catch { /* silent */ }
       setSlackLinkedinLoading(false)
+
+      // Auto-fetch mail
+      try {
+        const mr = await getAgentMailInbox(companyId)
+        setMailInbox(mr.inbox)
+        setMailMessages(mr.messages)
+      } catch { /* silent */ }
     }
+    loadDaily()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyId])
+
+  const handlePostSlackLinkedIn = () => {
+    if (!slackLinkedinDraft) return
+    // Open LinkedIn share dialog with pre-filled content
+    const shareUrl = `https://www.linkedin.com/feed/?shareActive=true&text=${encodeURIComponent(slackLinkedinDraft)}`
+    window.open(shareUrl, "_blank")
+    setSlackLinkedinPosted(true)
   }
 
   const handleFetchMail = async () => {
@@ -396,6 +435,24 @@ function DashboardContent({
       setMailMessages([])
     } finally {
       setMailLoading(false)
+    }
+  }
+
+  const handleAutoReply = async () => {
+    setAutoReplying(true)
+    try {
+      await triggerAutoReply(companyId)
+      // Refresh inbox after a delay to show replies
+      setTimeout(async () => {
+        try {
+          const mr = await getAgentMailInbox(companyId)
+          setMailMessages(mr.messages)
+        } catch { /* silent */ }
+        setAutoReplying(false)
+      }, 5000)
+    } catch {
+      alert("Auto-reply failed.")
+      setAutoReplying(false)
     }
   }
 
@@ -429,14 +486,14 @@ function DashboardContent({
             <div className="h-6 w-px bg-white/10" />
             <div>
               <div className="flex items-center gap-2">
-                <p className="text-sm font-semibold text-foreground">
+                <p className="text-base font-semibold text-foreground">
                   {companyName}
                 </p>
-                <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-400 ring-1 ring-emerald-500/20">
+                <span className="rounded-full bg-emerald-500/10 px-2.5 py-0.5 text-xs font-semibold text-emerald-400 ring-1 ring-emerald-500/20">
                   ACTIVE
                 </span>
               </div>
-              <p className="text-xs text-muted-foreground">
+              <p className="text-sm text-muted-foreground">
                 Agent: {agentName}
               </p>
             </div>
@@ -513,7 +570,7 @@ function DashboardContent({
                   <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
                   <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500" />
                 </span>
-                <span className="text-xs text-muted-foreground">Real-time</span>
+                <span className="text-sm text-muted-foreground">Real-time</span>
               </div>
             </div>
 
@@ -524,11 +581,11 @@ function DashboardContent({
           </div>
 
           {/* Right sidebar — Simulator */}
-          <div>
-            <div className="sticky top-20">
+          <div className="max-h-[calc(100vh-8rem)] overflow-y-auto pr-1">
+            <div>
               <button
                 onClick={() => setShowSimulator(!showSimulator)}
-                className="mb-4 flex w-full items-center justify-between rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3 text-sm font-semibold text-foreground transition-all hover:bg-white/[0.04]"
+                className="mb-4 flex w-full items-center justify-between rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3 text-base font-semibold text-foreground transition-all hover:bg-white/[0.04]"
               >
                 <div className="flex items-center gap-2.5">
                   <Bot className="h-4.5 w-4.5 text-violet-400" />
@@ -543,7 +600,7 @@ function DashboardContent({
 
               {showSimulator && (
                 <div className="rounded-2xl border border-white/5 bg-white/[0.02] p-5 animate-in fade-in slide-in-from-top-2 duration-200">
-                  <p className="mb-4 text-xs text-muted-foreground">
+                  <p className="mb-4 text-sm text-muted-foreground">
                     Simulate a community question. Calex will respond in real-time and post to Discord.
                   </p>
 
@@ -553,7 +610,7 @@ function DashboardContent({
                       <button
                         key={p}
                         onClick={() => setSimPlatform(p)}
-                        className={`flex-1 rounded-md px-3 py-2 text-xs font-semibold capitalize transition-all ${
+                        className={`flex-1 rounded-md px-3 py-2 text-sm font-semibold capitalize transition-all ${
                           simPlatform === p
                             ? "bg-gradient-to-r from-violet-600 to-purple-600 text-white shadow-sm"
                             : "text-muted-foreground hover:text-foreground"
@@ -574,7 +631,7 @@ function DashboardContent({
                       <button
                         key={q}
                         onClick={() => setSimMessage(q)}
-                        className="rounded-lg border border-white/5 bg-white/[0.02] px-2.5 py-1 text-[11px] text-muted-foreground transition-all hover:border-violet-500/20 hover:text-foreground"
+                        className="rounded-lg border border-white/5 bg-white/[0.02] px-3 py-1.5 text-xs text-muted-foreground transition-all hover:border-violet-500/20 hover:text-foreground"
                       >
                         {q}
                       </button>
@@ -616,144 +673,102 @@ function DashboardContent({
                 </div>
               )}
 
-              {/* LinkedIn Posting */}
+              {/* LinkedIn connection (hidden, triggered by Daily Post) */}
+              <button
+                onClick={handleConnectLinkedIn}
+                className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-white/5 bg-white/[0.02] px-3 py-1.5 text-[10px] font-medium text-muted-foreground transition-all hover:text-foreground hover:bg-white/5"
+              >
+                <Link2 className="h-3 w-3" />
+                Connect LinkedIn
+              </button>
+
+              {/* ── Live Research (Browser Use OSS) ── */}
               <div className="mt-4 rounded-2xl border border-white/5 bg-white/[0.02] p-5">
-                <div className="mb-4 flex items-center justify-between">
+                <div className="mb-3 flex items-center justify-between">
                   <div className="flex items-center gap-2.5">
-                    <Linkedin className="h-4.5 w-4.5 text-blue-400" />
-                    <span className="text-sm font-semibold text-foreground">LinkedIn Post</span>
+                    <Search className="h-4.5 w-4.5 text-emerald-400" />
+                    <span className="text-sm font-semibold text-foreground">Live Research</span>
                   </div>
-                  <button
-                    onClick={handleConnectLinkedIn}
-                    className="inline-flex items-center gap-1 rounded-lg border border-white/5 bg-white/[0.02] px-2 py-1 text-[10px] font-medium text-muted-foreground transition-all hover:text-foreground hover:bg-white/5"
-                  >
-                    <Link2 className="h-3 w-3" />
-                    Connect
-                  </button>
+                  {researchStatus === "running" && (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-semibold text-emerald-400">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                      Running
+                    </span>
+                  )}
+                  {researchStatus === "completed" && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-semibold text-emerald-400">
+                      <CheckCircle2 className="h-3 w-3" /> Done
+                    </span>
+                  )}
                 </div>
 
-                <p className="mb-3 text-xs text-muted-foreground">
-                  Generate a LinkedIn post from recent community discussions, then review and publish.
+                <p className="mb-3 text-[11px] text-muted-foreground">
+                  Opens a live browser to scan GitHub, Reddit, and HN for leads and community signals.
                 </p>
 
-                <input
-                  type="text"
-                  value={linkedinTopic}
-                  onChange={(e) => setLinkedinTopic(e.target.value)}
-                  placeholder="Topic hint (optional)..."
-                  className="mb-3 w-full rounded-xl border border-white/10 bg-white/5 px-3.5 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-blue-500/30 focus:outline-none focus:ring-1 focus:ring-blue-500/20"
-                />
-
                 <button
-                  onClick={handleGenerateLinkedIn}
-                  disabled={linkedinLoading}
-                  className="mb-3 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-blue-500/25 transition-all hover:shadow-blue-500/40 disabled:opacity-50"
+                  onClick={handleRunResearch}
+                  disabled={researchStatus === "running"}
+                  className="mb-3 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-500 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-500/25 transition-all hover:shadow-emerald-500/40 disabled:opacity-50"
                 >
-                  {linkedinLoading && !linkedinDraft ? (
+                  {researchStatus === "running" ? (
                     <>
                       <RefreshCw className="h-4 w-4 animate-spin" />
-                      Generating...
+                      Browser running...
                     </>
                   ) : (
                     <>
-                      <Sparkles className="h-4 w-4" />
-                      Generate Post
+                      <Globe className="h-4 w-4" />
+                      Run Live Research
                     </>
                   )}
                 </button>
 
-                {linkedinDraft && (
-                  <div className="rounded-xl border border-blue-500/10 bg-blue-500/5 p-3">
-                    <textarea
-                      value={linkedinDraft}
-                      onChange={(e) => setLinkedinDraft(e.target.value)}
-                      rows={8}
-                      className="mb-3 w-full resize-none rounded-lg bg-transparent text-xs text-foreground leading-relaxed focus:outline-none"
-                    />
-                    {linkedinPosted ? (
-                      <div className="flex items-center gap-2 text-emerald-400 text-xs font-semibold">
-                        <CheckCircle2 className="h-4 w-4" />
-                        Posted to LinkedIn!
-                      </div>
-                    ) : (
-                      <button
-                        onClick={handlePostLinkedIn}
-                        disabled={linkedinLoading}
-                        className="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-blue-500/30 bg-blue-500/10 px-4 py-2 text-xs font-semibold text-blue-400 transition-all hover:bg-blue-500/20 disabled:opacity-50"
-                      >
-                        {linkedinLoading ? (
-                          <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <Send className="h-3.5 w-3.5" />
-                        )}
-                        Confirm &amp; Post to LinkedIn
-                      </button>
-                    )}
+                {/* Live log */}
+                {researchLog.length > 0 && (
+                  <div className="rounded-xl border border-emerald-500/10 bg-black/30 p-3 font-mono text-[10px] text-emerald-400/80 max-h-32 overflow-y-auto">
+                    {researchLog.map((line, i) => (
+                      <div key={i} className="mb-0.5">&gt; {line}</div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Result */}
+                {researchResult && researchStatus === "completed" && (
+                  <div className="mt-3 rounded-xl border border-emerald-500/10 bg-emerald-500/5 p-3">
+                    <p className="text-[10px] font-semibold text-emerald-400 mb-1">Research Report:</p>
+                    <p className="text-[11px] text-muted-foreground whitespace-pre-wrap leading-relaxed max-h-48 overflow-y-auto">{researchResult}</p>
                   </div>
                 )}
               </div>
 
-              {/* ── Leads Intelligence ── */}
+              {/* ── Today's Leads ── */}
               <div className="mt-4 rounded-2xl border border-white/5 bg-white/[0.02] p-5">
-                <div className="mb-4 flex items-center justify-between">
+                <button
+                  onClick={() => setShowLeads(!showLeads)}
+                  className="w-full flex items-center justify-between"
+                >
                   <div className="flex items-center gap-2.5">
                     <Users className="h-4.5 w-4.5 text-amber-400" />
-                    <span className="text-sm font-semibold text-foreground">Lead Intelligence</span>
+                    <span className="text-sm font-semibold text-foreground">Today&apos;s Leads</span>
                   </div>
-                  <div className="flex gap-1">
-                    <button
-                      onClick={() => handleConnectGoogle("googlecalendar")}
-                      className="inline-flex items-center gap-1 rounded-lg border border-white/5 bg-white/[0.02] px-2 py-1 text-[10px] font-medium text-muted-foreground transition-all hover:text-foreground hover:bg-white/5"
-                    >
-                      <Calendar className="h-3 w-3" />
-                      Cal
-                    </button>
-                    <button
-                      onClick={() => handleConnectGoogle("googlesheets")}
-                      className="inline-flex items-center gap-1 rounded-lg border border-white/5 bg-white/[0.02] px-2 py-1 text-[10px] font-medium text-muted-foreground transition-all hover:text-foreground hover:bg-white/5"
-                    >
-                      <FileSpreadsheet className="h-3 w-3" />
-                      Sheets
-                    </button>
+                  <div className="flex items-center gap-2">
+                    {leadsLoading ? (
+                      <div className="flex items-center gap-1.5">
+                        <RefreshCw className="h-3 w-3 animate-spin text-amber-400" />
+                        <span className="text-[10px] text-muted-foreground">Scanning...</span>
+                      </div>
+                    ) : (
+                      <span className="inline-flex items-center justify-center h-6 min-w-[24px] rounded-full bg-amber-500/20 px-2 text-xs font-bold text-amber-400">
+                        {leads.length}
+                      </span>
+                    )}
                   </div>
-                </div>
-
-                <p className="mb-3 text-xs text-muted-foreground">
-                  Analyze conversations to find developer leads. Schedule meetings or log them to a Google Sheet.
-                </p>
-
-                <input
-                  type="text"
-                  value={sheetId}
-                  onChange={(e) => setSheetId(e.target.value)}
-                  placeholder="Google Sheet ID (optional)..."
-                  className="mb-3 w-full rounded-xl border border-white/10 bg-white/5 px-3.5 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-amber-500/30 focus:outline-none focus:ring-1 focus:ring-amber-500/20"
-                />
-
-                <button
-                  onClick={handleExtractLeads}
-                  disabled={leadsLoading}
-                  className="mb-3 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-600 to-orange-500 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-amber-500/25 transition-all hover:shadow-amber-500/40 disabled:opacity-50"
-                >
-                  {leadsLoading ? (
-                    <>
-                      <RefreshCw className="h-4 w-4 animate-spin" />
-                      Analyzing...
-                    </>
-                  ) : (
-                    <>
-                      <Users className="h-4 w-4" />
-                      Extract Leads
-                    </>
-                  )}
                 </button>
 
-                {leadsSummary && (
-                  <p className="mb-3 text-xs text-amber-400/80 italic">{leadsSummary}</p>
-                )}
-
-                {leads.length > 0 && (
-                  <div className="flex flex-col gap-2">
+                {showLeads && leads.length > 0 && (
+                  <div className="mt-3 flex flex-col gap-2 animate-in fade-in slide-in-from-top-2 duration-200">
+                    <p className="text-[11px] text-amber-400/70 italic mb-1">{leadsSummary}</p>
                     {leads.map((lead, i) => (
                       <div key={i} className="rounded-xl border border-amber-500/10 bg-amber-500/5 p-3">
                         <div className="flex items-center justify-between mb-1.5">
@@ -780,15 +795,13 @@ function DashboardContent({
                             )}
                             Schedule
                           </button>
-                          {sheetId && (
-                            <button
-                              onClick={() => handleLogToSheet(lead)}
-                              className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-2 py-1 text-[10px] font-semibold text-emerald-400 transition-all hover:bg-emerald-500/20"
-                            >
-                              <FileSpreadsheet className="h-3 w-3" />
-                              Log
-                            </button>
-                          )}
+                          <button
+                            onClick={() => handleLogToSheet(lead)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-2 py-1 text-[10px] font-semibold text-emerald-400 transition-all hover:bg-emerald-500/20"
+                          >
+                            <FileSpreadsheet className="h-3 w-3" />
+                            Log
+                          </button>
                         </div>
                       </div>
                     ))}
@@ -796,54 +809,31 @@ function DashboardContent({
                 )}
               </div>
 
-              {/* ── Slack → LinkedIn ── */}
+              {/* ── Daily Content Recommendation ── */}
               <div className="mt-4 rounded-2xl border border-white/5 bg-white/[0.02] p-5">
-                <div className="mb-4 flex items-center justify-between">
+                <div className="mb-3 flex items-center justify-between">
                   <div className="flex items-center gap-2.5">
-                    <MessageSquareText className="h-4.5 w-4.5 text-purple-400" />
-                    <span className="text-sm font-semibold text-foreground">Slack → LinkedIn</span>
+                    <Linkedin className="h-4.5 w-4.5 text-blue-400" />
+                    <span className="text-sm font-semibold text-foreground">Daily Post</span>
                   </div>
-                  <button
-                    onClick={() => handleConnectGoogle("slack")}
-                    className="inline-flex items-center gap-1 rounded-lg border border-white/5 bg-white/[0.02] px-2 py-1 text-[10px] font-medium text-muted-foreground transition-all hover:text-foreground hover:bg-white/5"
-                  >
-                    <Link2 className="h-3 w-3" />
-                    Connect Slack
-                  </button>
+                  {slackLinkedinLoading ? (
+                    <div className="flex items-center gap-1.5">
+                      <RefreshCw className="h-3 w-3 animate-spin text-blue-400" />
+                      <span className="text-[10px] text-muted-foreground">Generating...</span>
+                    </div>
+                  ) : slackLinkedinDraft ? (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-blue-500/20 px-2 py-0.5 text-[10px] font-semibold text-blue-400">
+                      <Sparkles className="h-3 w-3" /> Ready
+                    </span>
+                  ) : null}
                 </div>
 
-                <p className="mb-3 text-xs text-muted-foreground">
-                  Pull conversations from your Slack channel and auto-generate a LinkedIn post. Just click post.
+                <p className="mb-3 text-[11px] text-muted-foreground">
+                  Auto-generated from today&apos;s team conversations and community activity.
                 </p>
 
-                <input
-                  type="text"
-                  value={slackChannel}
-                  onChange={(e) => setSlackChannel(e.target.value)}
-                  placeholder="Slack channel name..."
-                  className="mb-3 w-full rounded-xl border border-white/10 bg-white/5 px-3.5 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-purple-500/30 focus:outline-none focus:ring-1 focus:ring-purple-500/20"
-                />
-
-                <button
-                  onClick={handleSlackToLinkedIn}
-                  disabled={slackLinkedinLoading}
-                  className="mb-3 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-purple-600 to-pink-500 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-purple-500/25 transition-all hover:shadow-purple-500/40 disabled:opacity-50"
-                >
-                  {slackLinkedinLoading ? (
-                    <>
-                      <RefreshCw className="h-4 w-4 animate-spin" />
-                      Generating from Slack...
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="h-4 w-4" />
-                      Generate from Slack
-                    </>
-                  )}
-                </button>
-
                 {slackLinkedinDraft && (
-                  <div className="rounded-xl border border-purple-500/10 bg-purple-500/5 p-3">
+                  <div className="rounded-xl border border-blue-500/10 bg-blue-500/5 p-3 animate-in fade-in duration-300">
                     <textarea
                       value={slackLinkedinDraft}
                       onChange={(e) => setSlackLinkedinDraft(e.target.value)}
@@ -859,17 +849,17 @@ function DashboardContent({
                       <button
                         onClick={handlePostSlackLinkedIn}
                         disabled={slackLinkedinLoading}
-                        className="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-purple-500/30 bg-purple-500/10 px-4 py-2 text-xs font-semibold text-purple-400 transition-all hover:bg-purple-500/20 disabled:opacity-50"
+                        className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-blue-500/25 transition-all hover:shadow-blue-500/40 disabled:opacity-50"
                       >
-                        {slackLinkedinLoading ? (
-                          <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <Send className="h-3.5 w-3.5" />
-                        )}
-                        Confirm &amp; Post to LinkedIn
+                        <Linkedin className="h-3.5 w-3.5" />
+                        Post to LinkedIn
                       </button>
                     )}
                   </div>
+                )}
+
+                {!slackLinkedinDraft && !slackLinkedinLoading && (
+                  <p className="text-xs text-muted-foreground/50 italic text-center py-4">No post generated yet. Add messages to your team channel.</p>
                 )}
               </div>
 
@@ -878,20 +868,30 @@ function DashboardContent({
                 <div className="mb-4 flex items-center justify-between">
                   <div className="flex items-center gap-2.5">
                     <Mail className="h-4.5 w-4.5 text-cyan-400" />
-                    <span className="text-sm font-semibold text-foreground">Agent Email</span>
+                    <span className="text-base font-semibold text-foreground">Agent Email</span>
                   </div>
-                  <button
-                    onClick={handleFetchMail}
-                    disabled={mailLoading}
-                    className="inline-flex items-center gap-1 rounded-lg border border-white/5 bg-white/[0.02] px-2 py-1 text-[10px] font-medium text-muted-foreground transition-all hover:text-foreground hover:bg-white/5"
-                  >
-                    {mailLoading ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Inbox className="h-3 w-3" />}
-                    Refresh
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={handleAutoReply}
+                      disabled={autoReplying}
+                      className="inline-flex items-center gap-1 rounded-lg bg-gradient-to-r from-cyan-600 to-teal-500 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition-all hover:shadow-cyan-500/30 disabled:opacity-50"
+                    >
+                      {autoReplying ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
+                      {autoReplying ? "Replying..." : "Auto-Reply All"}
+                    </button>
+                    <button
+                      onClick={handleFetchMail}
+                      disabled={mailLoading}
+                      className="inline-flex items-center gap-1 rounded-lg border border-white/5 bg-white/[0.02] px-3 py-1.5 text-xs font-medium text-muted-foreground transition-all hover:text-foreground hover:bg-white/5"
+                    >
+                      {mailLoading ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Inbox className="h-3 w-3" />}
+                      Refresh
+                    </button>
+                  </div>
                 </div>
 
                 {mailInbox && (
-                  <p className="mb-3 text-[10px] text-muted-foreground font-mono truncate">
+                  <p className="mb-3 text-xs text-muted-foreground font-mono truncate">
                     Inbox: {mailInbox}
                   </p>
                 )}
@@ -903,14 +903,14 @@ function DashboardContent({
                     value={mailTo}
                     onChange={(e) => setMailTo(e.target.value)}
                     placeholder="To (e.g. rajashekarvennavelli@gmail.com)..."
-                    className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-foreground placeholder:text-muted-foreground/50 focus:border-cyan-500/30 focus:outline-none"
+                    className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-cyan-500/30 focus:outline-none"
                   />
                   <input
                     type="text"
                     value={mailSubject}
                     onChange={(e) => setMailSubject(e.target.value)}
                     placeholder="Subject..."
-                    className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-foreground placeholder:text-muted-foreground/50 focus:border-cyan-500/30 focus:outline-none"
+                    className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-cyan-500/30 focus:outline-none"
                   />
                   <textarea
                     value={mailBody}
@@ -943,15 +943,15 @@ function DashboardContent({
                 {mailMessages.length > 0 && (
                   <div className="flex flex-col gap-2 max-h-64 overflow-y-auto">
                     {mailMessages.map((msg, i) => (
-                      <div key={i} className={`rounded-xl border p-2.5 ${msg.direction === "outbound" ? "border-cyan-500/10 bg-cyan-500/5" : "border-white/5 bg-white/[0.02]"}`}>
+                      <div key={i} className={`rounded-xl border p-3 ${msg.direction === "outbound" ? "border-cyan-500/10 bg-cyan-500/5" : "border-white/5 bg-white/[0.02]"}`}>
                         <div className="flex items-center justify-between mb-1">
-                          <span className="text-[10px] font-semibold text-foreground truncate max-w-[60%]">
+                          <span className="text-xs font-semibold text-foreground truncate max-w-[60%]">
                             {msg.direction === "outbound" ? `→ ${msg.to}` : `← ${msg.from}`}
                           </span>
-                          <span className="text-[9px] text-muted-foreground">{msg.date ? new Date(msg.date).toLocaleDateString() : ""}</span>
+                          <span className="text-[11px] text-muted-foreground">{msg.date ? new Date(msg.date).toLocaleDateString() : ""}</span>
                         </div>
-                        <p className="text-[11px] font-medium text-foreground mb-0.5">{msg.subject}</p>
-                        <p className="text-[10px] text-muted-foreground line-clamp-2">{msg.text}</p>
+                        <p className="text-sm font-medium text-foreground mb-0.5">{msg.subject}</p>
+                        <p className="text-xs text-muted-foreground line-clamp-2">{msg.text}</p>
                       </div>
                     ))}
                   </div>

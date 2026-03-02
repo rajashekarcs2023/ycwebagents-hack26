@@ -1,5 +1,6 @@
 "use client"
 
+import { useState } from "react"
 import {
   MessageSquare,
   Globe,
@@ -12,6 +13,8 @@ import {
   Eye,
   Search,
   Link2,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react"
 import type { ActivityFeedItem } from "@/lib/api"
 
@@ -53,41 +56,59 @@ interface ActivityItemProps {
 }
 
 export function ActivityItem({ item, onWatch }: ActivityItemProps) {
+  const [expanded, setExpanded] = useState(false)
   const config = typeConfig[item.type] || { icon: MessageSquare, color: "bg-violet-500/10 text-violet-400" }
   const Icon = config.icon
   const status = statusStyles[item.status] || statusStyles.pending
 
   return (
-    <div className="group flex items-start gap-3.5 rounded-xl border border-white/5 bg-white/[0.02] p-4 transition-all duration-200 hover:border-violet-500/10 hover:bg-white/[0.04] animate-in fade-in slide-in-from-top-2 duration-300">
-      <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${config.color}`}>
-        <Icon className="h-4 w-4" />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <p className="font-semibold text-sm text-foreground">{item.title}</p>
-          <span className="inline-flex items-center gap-1 text-[10px] font-medium">
-            <span className={`h-1.5 w-1.5 rounded-full ${status.dot}`} />
-            <span className={status.text}>{item.status}</span>
-          </span>
+    <div
+      className="group cursor-pointer rounded-xl border border-white/5 bg-white/[0.02] p-4 transition-all duration-200 hover:border-violet-500/10 hover:bg-white/[0.04] animate-in fade-in slide-in-from-top-2 duration-300"
+      onClick={() => setExpanded(!expanded)}
+    >
+      <div className="flex items-start gap-3.5">
+        <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${config.color}`}>
+          <Icon className="h-5 w-5" />
         </div>
-        <p className="mt-0.5 text-xs text-muted-foreground line-clamp-1 leading-relaxed">
-          {item.detail}
-        </p>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <p className="font-semibold text-base text-foreground">{item.title}</p>
+            <span className="inline-flex items-center gap-1 text-xs font-medium">
+              <span className={`h-1.5 w-1.5 rounded-full ${status.dot}`} />
+              <span className={status.text}>{item.status}</span>
+            </span>
+          </div>
+          <p className={`mt-1 text-sm text-muted-foreground leading-relaxed ${expanded ? "" : "line-clamp-1"}`}>
+            {item.detail}
+          </p>
+          {expanded && (
+            <p className="mt-2 text-xs text-muted-foreground/50 font-mono">
+              {item.type} &middot; {new Date(item.ts).toLocaleString()}
+            </p>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <span className="text-xs text-muted-foreground/60 font-mono">
+            {getRelativeTime(item.ts)}
+          </span>
+          {expanded ? (
+            <ChevronUp className="h-4 w-4 text-muted-foreground/40" />
+          ) : (
+            <ChevronDown className="h-4 w-4 text-muted-foreground/40" />
+          )}
+        </div>
       </div>
-      <div className="flex shrink-0 items-center gap-2">
-        <span className="text-[11px] text-muted-foreground/60 font-mono">
-          {getRelativeTime(item.ts)}
-        </span>
-        {item.session_id && onWatch && (
+      {expanded && item.session_id && onWatch && (
+        <div className="mt-3 ml-12">
           <button
-            onClick={() => onWatch(item.session_id!)}
-            className="inline-flex items-center gap-1 rounded-lg bg-violet-500/10 px-2.5 py-1 text-[11px] font-semibold text-violet-400 transition-all hover:bg-violet-500/20"
+            onClick={(e) => { e.stopPropagation(); onWatch(item.session_id!) }}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-violet-500/10 px-3 py-1.5 text-sm font-semibold text-violet-400 transition-all hover:bg-violet-500/20"
           >
             <Eye className="h-3 w-3" />
-            Watch
+            Watch Walkthrough
           </button>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   )
 }

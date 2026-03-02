@@ -309,6 +309,14 @@ export async function sendAgentMail(
   return res.json()
 }
 
+export async function triggerAutoReply(companyId: string): Promise<{ status: string; message: string }> {
+  const res = await fetch(`${API}/api/agentmail/auto-reply?company_id=${companyId}`, {
+    method: "POST",
+  })
+  if (!res.ok) throw new Error("Auto-reply trigger failed")
+  return res.json()
+}
+
 // ─── Dashboard Chat ───────────────────────────────────────────────────────
 
 export async function dashboardChat(
@@ -332,5 +340,13 @@ export async function triggerDailyResearch(
     method: "POST",
   })
   if (!res.ok) throw new Error("Daily research trigger failed")
+  return res.json()
+}
+
+export async function getResearchStatus(
+  companyId: string,
+): Promise<{ status: string; log: string[]; result: string | null }> {
+  const res = await fetch(`${API}/api/cron/daily-research/status?company_id=${companyId}`)
+  if (!res.ok) throw new Error("Research status fetch failed")
   return res.json()
 }

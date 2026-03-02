@@ -24,6 +24,7 @@ from models import (
 )
 from services import supermemory_client, agentmail_client, browser_use_client, vapi_client, minimax_tts, llm
 from services import composio_client
+from services import slack_client
 from services import discord_webhook
 from services import llms_txt_crawler
 from services.discord_bot import start_bot, stop_bot
@@ -772,13 +773,12 @@ async def log_lead_to_sheet(
 
 @app.post("/api/slack/fetch")
 async def fetch_slack_messages(company_id: str, channel: str = "all-calexai", limit: int = 20):
-    """Fetch recent messages from a Slack channel via Composio."""
+    """Fetch recent messages from a Slack channel using direct Bot Token."""
     company = db.get_by_field("companies", Company, "company_id", company_id)
     if not company:
         raise HTTPException(404, "Company not found")
 
-    result = await composio_client.fetch_slack_messages(
-        user_id=company_id,
+    result = await slack_client.fetch_messages(
         channel_name=channel,
         limit=limit,
     )
@@ -800,17 +800,19 @@ async def slack_to_linkedin(company_id: str, channel: str = "all-calexai"):
     if not company:
         raise HTTPException(404, "Company not found")
 
-    # Step 1: Fetch Slack messages
-    slack_result = await composio_client.fetch_slack_messages(
-        user_id=company_id,
+    # Step 1: Fetch Slack messages using direct Bot Token
+    slack_result = await slack_client.fetch_messages(
         channel_name=channel,
         limit=25,
     )
 
+    if "error" in slack_result:
+        raise HTTPException(500, slack_result["error"])
+
     messages = slack_result.get("messages", [])
     if not messages:
         return {"post_text": "", "hashtags": [], "slack_messages": 0,
-                "error": "No Slack messages found. Connect Slack via Composio first."}
+                "error": "No messages found in the channel."}
 
     # Step 2: Format messages as context
     slack_text = "\n".join([
@@ -857,14 +859,15 @@ async def get_agentmail_inbox(company_id: str):
         messages_resp = client.inboxes.messages.list(inbox_id=inbox_id)
         messages = []
         for msg in getattr(messages_resp, "messages", []) or []:
+            body = getattr(msg, "text", "") or getattr(msg, "preview", "") or getattr(msg, "body", "")
             messages.append({
-                "id": getattr(msg, "id", "") or getattr(msg, "message_id", ""),
+                "id": getattr(msg, "message_id", "") or getattr(msg, "id", ""),
                 "from": getattr(msg, "from_", "") or getattr(msg, "sender", ""),
                 "to": getattr(msg, "to", ""),
                 "subject": getattr(msg, "subject", ""),
-                "text": getattr(msg, "text", "") or getattr(msg, "body", ""),
-                "date": getattr(msg, "date", "") or getattr(msg, "created_at", ""),
-                "direction": "inbound" if getattr(msg, "from_", "") != inbox_id else "outbound",
+                "text": body,
+                "date": str(getattr(msg, "timestamp", "")) or str(getattr(msg, "created_at", "")),
+                "direction": "inbound" if inbox_id not in str(getattr(msg, "from_", "")) else "outbound",
             })
         return {"inbox": inbox_id, "messages": messages}
     except Exception as e:
@@ -902,6 +905,90 @@ async def send_agentmail(
     except Exception as e:
         print(f"[AgentMail] Send error: {e}")
         raise HTTPException(500, str(e))
+
+
+@app.post("/api/agentmail/auto-reply")
+async def agentmail_auto_reply(company_id: str, background_tasks: BackgroundTasks):
+    """Auto-reply to all unanswered inbound emails using LLM."""
+    company = db.get_by_field("companies", Company, "company_id", company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+    agent = db.get_by_field("agent_identities", AgentIdentity, "company_id", company_id)
+    if not agent or not agent.agentmail_address:
+        raise HTTPException(400, "No agent inbox configured")
+
+    background_tasks.add_task(_auto_reply_emails, company, agent)
+    return {"status": "started", "message": "Auto-replying to inbound emails..."}
+
+
+async def _auto_reply_emails(company: Company, agent: AgentIdentity):
+    """Background task: generate and send LLM replies to inbound emails."""
+    try:
+        client = agentmail_client.get_client()
+        inbox_id = agent.agentmail_address
+        messages_resp = client.inboxes.messages.list(inbox_id=inbox_id)
+        msgs = getattr(messages_resp, "messages", []) or []
+
+        # Find inbound emails (not from us)
+        inbound = [m for m in msgs if inbox_id not in str(getattr(m, "from_", ""))]
+
+        # Check which ones we've already replied to (by thread_id or in_reply_to)
+        replied_threads = set()
+        for m in msgs:
+            if inbox_id in str(getattr(m, "from_", "")):
+                replied_threads.add(getattr(m, "thread_id", ""))
+                replied_threads.add(getattr(m, "in_reply_to", ""))
+
+        for msg in inbound:
+            thread_id = getattr(msg, "thread_id", "")
+            msg_id = getattr(msg, "message_id", "")
+            if thread_id in replied_threads or msg_id in replied_threads:
+                continue  # Already replied
+
+            sender = str(getattr(msg, "from_", ""))
+            subject = getattr(msg, "subject", "")
+            body = getattr(msg, "text", "") or getattr(msg, "preview", "") or ""
+
+            # Generate reply with LLM
+            reply_prompt = f"""You are Calex, an AI DevRel agent for {company.name}.
+A developer sent this email to your inbox. Write a helpful, friendly reply.
+Keep it concise (3-5 sentences). Be professional but warm. Sign off as "Calex AI, DevRel Agent for {company.name}".
+
+From: {sender}
+Subject: {subject}
+Body: {body}
+
+Write ONLY the reply email body, no subject line:"""
+
+            try:
+                import openai
+                oai = openai.AsyncOpenAI()
+                resp = await oai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": reply_prompt}],
+                    max_tokens=300,
+                )
+                reply_text = resp.choices[0].message.content.strip()
+
+                # Extract email address from "Name <email>" format
+                import re
+                email_match = re.search(r'<([^>]+)>', sender)
+                to_email = email_match.group(1) if email_match else sender
+
+                await agentmail_client.send_email(
+                    from_inbox=inbox_id,
+                    to=to_email,
+                    subject=f"Re: {subject}",
+                    text=reply_text,
+                )
+                print(f"[AutoReply] Replied to {to_email}: {subject}")
+                emit_activity(company.company_id, "email_sent",
+                              f"Auto-replied to {to_email}",
+                              f"Re: {subject}")
+            except Exception as e:
+                print(f"[AutoReply] Failed for {sender}: {e}")
+    except Exception as e:
+        print(f"[AutoReply] Error: {e}")
 
 
 # ─── Dashboard Chat ──────────────────────────────────────────────────────────
@@ -945,78 +1032,116 @@ async def dashboard_chat(company_id: str, question: str):
     return {"answer": answer}
 
 
-# ─── Browser Use: Daily Lead Research Cron ───────────────────────────────────
+# ─── Browser Use: Live Research (OSS — visible browser) ──────────────────────
+
+# In-memory store for live research status (demo-only, not persisted)
+_live_research: dict = {}  # company_id -> {status, log, result}
 
 @app.post("/api/cron/daily-research")
 async def daily_lead_research(company_id: str, background_tasks: BackgroundTasks):
-    """Trigger the daily Browser Use research job: find leads, community signals, competitor activity."""
+    """Trigger a LIVE Browser Use research job — opens a visible browser on the machine."""
     company = db.get_by_field("companies", Company, "company_id", company_id)
     if not company:
         raise HTTPException(404, "Company not found")
 
+    if _live_research.get(company_id, {}).get("status") == "running":
+        return {"status": "already_running", "message": "Research is already in progress"}
+
+    _live_research[company_id] = {"status": "running", "log": ["Starting live research..."], "result": None}
+
     emit_activity(company_id, "cron_started",
-                  "Daily research job started",
-                  "Browser Use agent scanning for leads and activity", status="pending")
+                  "Live research started",
+                  "Browser Use agent scanning GitHub, Reddit, HN for leads", status="pending")
 
-    background_tasks.add_task(_run_daily_research, company_id, company.name, company.website_url)
-    return {"status": "started", "message": "Daily research job queued"}
+    background_tasks.add_task(_run_live_research, company_id, company.name)
+    return {"status": "started", "message": "Live browser research started — watch the browser!"}
 
 
-async def _run_daily_research(company_id: str, company_name: str, website_url: str):
-    """Background: Use Browser Use to research leads and DevRel-relevant activity."""
-    research_prompt = f"""You are a DevRel research agent for {company_name} ({website_url}).
-Your daily job is to find valuable intelligence. Do the following:
+@app.get("/api/cron/daily-research/status")
+async def get_research_status(company_id: str):
+    """Poll the live research status."""
+    state = _live_research.get(company_id, {"status": "idle", "log": [], "result": None})
+    return state
 
-1. Go to GitHub and search for "{company_name}" — find recent issues, discussions, or mentions. Note any developers who seem interested.
-2. Go to Twitter/X and search for "{company_name}" — find recent tweets mentioning the product. Note usernames and what they said.
-3. Go to Reddit and search for "{company_name}" — find any threads or comments about it.
-4. Check Hacker News for any mentions.
+
+async def _run_live_research(company_id: str, company_name: str):
+    """Background: Use browser-use OSS with headless=False for a VISIBLE browser demo."""
+    research_prompt = f"""You are a DevRel research agent for {company_name}.
+Your job is to find leads, community signals, and relevant developer activity.
+
+Do these steps in order:
+1. Go to https://github.com/browser-use/browser-use/issues — scan the latest open issues. For each interesting issue, note the developer username, issue title, and whether they seem like a potential lead.
+2. Go to https://github.com/browser-use/browser-use — note the star count and recent activity.
+3. Go to https://www.reddit.com/search/?q=browser+use+ai+agent — find any relevant Reddit threads about browser automation AI. Note usernames and what they said.
+4. Go to https://news.ycombinator.com/newest and search for "browser use" — check for any HN mentions.
 
 For each finding, report:
-- Platform (GitHub/Twitter/Reddit/HN)
+- Platform (GitHub/Reddit/HN)
 - Username
-- What they said or did
-- Lead score (1-10, how likely they are to be a real lead)
-- Suggested follow-up action
+- What they said (1-2 sentences)
+- Lead score (1-10)
+- Suggested action
 
-Format as a structured report."""
+Return a structured report."""
 
     try:
-        client = browser_use_client.get_client()
-        result = await client.run(research_prompt)
-        output = result.output if hasattr(result, "output") else str(result)
+        from browser_use import Agent, Browser, ChatOpenAI
+        from dotenv import load_dotenv
+        load_dotenv()
 
-        # Log the research as a browser run
+        _live_research[company_id]["log"].append("Launching visible browser...")
+
+        browser = Browser(
+            headless=False,
+            window_size={"width": 1200, "height": 800},
+        )
+
+        llm_model = ChatOpenAI(model="gpt-4.1-mini")
+
+        agent = Agent(
+            task=research_prompt,
+            browser=browser,
+            llm=llm_model,
+        )
+
+        _live_research[company_id]["log"].append("Agent running — watch the browser window!")
+
+        result = await agent.run()
+        output = result.final_result() if hasattr(result, "final_result") else str(result)
+
+        _live_research[company_id]["log"].append("Research complete!")
+        _live_research[company_id]["status"] = "completed"
+        _live_research[company_id]["result"] = output
+
+        # Log as browser run
         run = BrowserRun(
             company_id=company_id,
             purpose="daily_lead_research",
             status="completed",
-            run_log=[f"Daily research completed at {now_iso()}", output[:500]],
-            final_url="https://github.com",
+            run_log=[f"Live research completed at {now_iso()}", str(output)[:500]],
+            final_url="https://github.com/browser-use/browser-use",
         )
         db.insert("browser_runs", run)
 
-        # Store research into Supermemory for the dashboard chat to access
+        emit_activity(company_id, "cron_completed",
+                      "Live research completed",
+                      str(output)[:200])
+
+        # Close browser
         try:
-            await supermemory_client.add_memory(
-                content=f"Daily research report ({now_iso()}):\n{output}",
-                company_id=company_id,
-                metadata={"source": "daily_research", "date": now_iso()},
-            )
+            await browser.close()
         except Exception:
             pass
 
-        # Extract leads from the research using LLM
-        leads_result = await llm.extract_leads(output, company_name)
-
-        emit_activity(company_id, "cron_completed",
-                      "Daily research completed",
-                      f"Found {len(leads_result.get('leads', []))} potential leads across GitHub, Twitter, Reddit, HN")
-
     except Exception as e:
-        print(f"[Cron] Daily research failed: {e}")
+        print(f"[LiveResearch] Failed: {e}")
+        import traceback
+        traceback.print_exc()
+        _live_research[company_id]["log"].append(f"Error: {e}")
+        _live_research[company_id]["status"] = "error"
+        _live_research[company_id]["result"] = str(e)
         emit_activity(company_id, "cron_completed",
-                      "Daily research failed",
+                      "Live research failed",
                       str(e), status="error")
 
 

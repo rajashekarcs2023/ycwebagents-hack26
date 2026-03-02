@@ -7,7 +7,7 @@ from browser_use_sdk import AsyncBrowserUse
 
 
 def get_client() -> AsyncBrowserUse:
-    return AsyncBrowserUse()
+    return AsyncBrowserUse(api_key=os.environ.get("BROWSER_USE_API_KEY", ""))
 
 
 async def scrape_website(url: str) -> list[str]:

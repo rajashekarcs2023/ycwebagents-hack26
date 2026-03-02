@@ -65,6 +65,10 @@ Calex is a single AI agent that operates across **Discord, Slack, Web Widget, Em
 
 ---
 
+## Tech Stack
+<img width="1312" height="975" alt="Screenshot 2026-03-01 at 1 40 57 PM" src="https://github.com/user-attachments/assets/fcf3493b-fb3e-4402-b1b6-57e607e9491e" />
+
+
 ## Quick Start
 
 ### Prerequisites

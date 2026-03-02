@@ -3,8 +3,13 @@
   // Usage: paste into browser console, or load as bookmarklet
   // Configure: set CALEX_SLUG to your company slug
 
-  var CALEX_SLUG = window.CALEX_SLUG || "browser-use";
-  var CALEX_HOST = window.CALEX_HOST || "http://localhost:3000";
+  var CALEX_SLUG = window.CALEX_SLUG || localStorage.getItem("calex_embed_slug") || "browser-use";
+  var CALEX_HOST = window.CALEX_HOST || localStorage.getItem("calex_embed_host") || "http://localhost:3000";
+
+  // Persist so widget survives page navigation
+  localStorage.setItem("calex_embed_slug", CALEX_SLUG);
+  localStorage.setItem("calex_embed_host", CALEX_HOST);
+  localStorage.setItem("calex_embed_active", "true");
 
   // Don't inject twice
   if (document.getElementById("calex-widget-root")) return;
@@ -112,10 +117,35 @@
         '<span style="opacity:0.7;font-weight:400;margin-left:auto;font-size:11px">' + url + '</span>';
       overlay.style.opacity = "1";
 
-      // Navigate after a short delay so user sees the overlay
+      // Open in new tab so narration audio keeps playing on current page
       setTimeout(function () {
-        window.location.href = url;
+        window.open(url, "_blank");
+        // Fade out overlay after a moment
+        setTimeout(function () {
+          if (overlay) overlay.style.opacity = "0";
+        }, 2000);
       }, 800);
+    }
+
+    if (event.data.type === "narrate") {
+      // Play narration audio on the PARENT page so it survives iframe reload
+      var audioUrl = event.data.audioUrl;
+      var text = event.data.text;
+      if (audioUrl) {
+        localStorage.setItem("calex_narration_url", audioUrl);
+        try {
+          var audio = new Audio(audioUrl);
+          audio.play();
+        } catch (e) { console.log("[Calex] Audio play failed:", e); }
+      } else if (text) {
+        localStorage.setItem("calex_narration_text", text);
+        try {
+          var u = new SpeechSynthesisUtterance(text);
+          u.rate = 1.0;
+          u.pitch = 1.0;
+          speechSynthesis.speak(u);
+        } catch (e) { console.log("[Calex] Speech failed:", e); }
+      }
     }
 
     if (event.data.type === "highlight") {
@@ -169,8 +199,30 @@
   document.body.appendChild(badge);
   document.body.appendChild(btn);
 
+  // Auto-open if we just navigated from a widget command
+  if (localStorage.getItem("calex_embed_autoopen") === "true") {
+    localStorage.removeItem("calex_embed_autoopen");
+    setTimeout(function () {
+      btn.click(); // auto-open the widget
+    }, 500);
+  }
+
   console.log(
     "%c✨ Calex AI widget injected! Click the purple button to chat.",
     "color:#a78bfa;font-weight:bold;font-size:14px;"
   );
 })();
+
+// ── Auto-re-inject on page load if previously activated ──
+// This small loader checks localStorage and re-injects on every page load
+if (typeof window.__calexLoaderSet === "undefined") {
+  window.__calexLoaderSet = true;
+  window.addEventListener("DOMContentLoaded", function () {
+    if (localStorage.getItem("calex_embed_active") === "true" && !document.getElementById("calex-widget-root")) {
+      var host = localStorage.getItem("calex_embed_host") || "http://localhost:3000";
+      var s = document.createElement("script");
+      s.src = host + "/embed.js";
+      document.head.appendChild(s);
+    }
+  });
+}

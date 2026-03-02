@@ -4,7 +4,7 @@ import { useState } from "react"
 import Link from "next/link"
 import { Zap, Copy, Check, Code, ArrowLeft, Globe } from "lucide-react"
 
-const CONSOLE_SNIPPET = `window.CALEX_SLUG="browser-use";window.CALEX_HOST="http://localhost:3000";var s=document.createElement("script");s.src="http://localhost:3000/embed.js";document.head.appendChild(s);`
+const CONSOLE_SNIPPET = `localStorage.setItem("calex_embed_active","true");window.CALEX_SLUG="browser-use";window.CALEX_HOST="http://localhost:3000";var s=document.createElement("script");s.src="http://localhost:3000/embed.js";document.head.appendChild(s);`
 
 const BOOKMARKLET = `javascript:void(${encodeURIComponent(CONSOLE_SNIPPET)})`
 

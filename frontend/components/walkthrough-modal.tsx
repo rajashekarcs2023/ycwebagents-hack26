@@ -73,6 +73,29 @@ export function WalkthroughModal({
     }
   }, [data?.run_log])
 
+  // Auto-play narration when modal opens
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (narrationAudioUrl) {
+        const audio = new Audio(narrationAudioUrl)
+        audioRef.current = audio
+        audio.onended = () => setIsNarrating(false)
+        audio.play().catch(() => {})
+        setIsNarrating(true)
+      } else if (narrationScript) {
+        try {
+          const utterance = new SpeechSynthesisUtterance(narrationScript)
+          utterance.rate = 1.0
+          utterance.pitch = 1.0
+          utterance.onend = () => setIsNarrating(false)
+          window.speechSynthesis.speak(utterance)
+          setIsNarrating(true)
+        } catch {}
+      }
+    }, 500)
+    return () => clearTimeout(timer)
+  }, [narrationAudioUrl, narrationScript])
+
   const handleNarrate = () => {
     if (isNarrating) {
       if (audioRef.current) {

@@ -129,17 +129,11 @@ export function CalexWidgetChat({
             showData.final_url
 
           if (navUrl) {
-            // Play narration audio if available
+            // Send narration to PARENT page so audio survives navigation
             if (showData.narration_audio_url) {
-              try {
-                const audio = new Audio(showData.narration_audio_url)
-                audio.play()
-              } catch { /* ignore audio errors */ }
+              sendToParent({ type: "narrate", audioUrl: showData.narration_audio_url })
             } else if (showData.narration_script) {
-              const utterance = new SpeechSynthesisUtterance(showData.narration_script)
-              utterance.rate = 1.0
-              utterance.pitch = 1.0
-              speechSynthesis.speak(utterance)
+              sendToParent({ type: "narrate", text: showData.narration_script })
             }
 
             // Show navigation message in chat
@@ -155,13 +149,36 @@ export function CalexWidgetChat({
 
             setNavigatingUrl(navUrl)
 
-            // Send navigation command to parent after a short delay
+            // Send navigation command to parent after delay for narration to start
             setTimeout(() => {
               sendToParent({ type: "navigate", url: navUrl })
-            }, 1500)
+            }, 2500)
           }
         } else {
-          // ── Normal mode: open walkthrough modal ──
+          // ── Normal mode: open walkthrough modal + play narration ──
+          // Auto-play narration in normal mode too
+          if (showData.narration_audio_url) {
+            try {
+              const audio = new Audio(showData.narration_audio_url)
+              audio.play()
+            } catch { /* ignore audio errors */ }
+          } else if (showData.narration_script) {
+            try {
+              const utterance = new SpeechSynthesisUtterance(showData.narration_script)
+              utterance.rate = 1.0
+              utterance.pitch = 1.0
+              speechSynthesis.speak(utterance)
+            } catch { /* ignore speech errors */ }
+          }
+
+          // Auto-navigate to the relevant URL in a new tab
+          const navUrl = showData.suggested_links?.[0] || showData.final_url
+          if (navUrl && navUrl.startsWith("http")) {
+            setTimeout(() => {
+              window.open(navUrl, "_blank")
+            }, 1500)
+          }
+
           setWalkthroughSession({
             sessionId: showData.session_id,
             narrationScript: showData.narration_script,
